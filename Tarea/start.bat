@@ -1,0 +1,3 @@
+@echo off
+echo 🐱 Iniciando API de Hechos de Gatos...
+docker-compose up --build

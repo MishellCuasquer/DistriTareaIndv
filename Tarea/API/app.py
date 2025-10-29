@@ -1,745 +1,554 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-import requests
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List
 import pyodbc
 import os
+from datetime import datetime, date
 from dotenv import load_dotenv
-from typing import Optional
 
+# Cargar variables de entorno
 load_dotenv()
-app = FastAPI(title="🍽️ Meals API")
 
-# Conexión a SQL Server
+# Configuración de la aplicación
+app = FastAPI(
+    title="🛒 API de Inventario de Comida",
+    description="Sistema de gestión de inventario para alimentos",
+    version="1.0.0"
+)
+
+# Configuración de la base de datos
 conn_str = (
     f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={os.getenv('DB_SERVER')};"
+    f"SERVER={os.getenv('DB_SERVER')},{os.getenv('DB_PORT')};"
     f"DATABASE={os.getenv('DB_NAME')};"
     f"UID={os.getenv('DB_USER')};"
     f"PWD={os.getenv('DB_PASSWORD')};"
     f"TrustServerCertificate=yes;"
 )
 
-THEMEALDB_URL = "https://www.themealdb.com/api/json/v1/1/random.php"
+# Modelos Pydantic
+class ProductoBase(BaseModel):
+    codigo_barras: str = Field(..., max_length=50)
+    nombre: str = Field(..., max_length=100)
+    descripcion: Optional[str] = Field(None, max_length=255)
+    categoria: Optional[str] = Field(None, max_length=50)
+    proveedor: Optional[str] = Field(None, max_length=100)
+    precio_compra: float = Field(..., gt=0)
+    precio_venta: float = Field(..., gt=0)
+    stock_actual: int = Field(0, ge=0)
+    stock_minimo: int = Field(10, ge=0)
+    fecha_vencimiento: Optional[date] = None
 
-# Modelos
-class MealCreate(BaseModel):
-    name: str
-    categoria: str
-    area: str
-    image_url: str
+    @validator('precio_venta')
+    def precio_venta_mayor_compra(cls, v, values):
+        if 'precio_compra' in values and v < values['precio_compra']:
+            raise ValueError('El precio de venta debe ser mayor o igual al precio de compra')
+        return v
 
-class MealUpdate(BaseModel):
-    name: Optional[str] = None
-    categoria: Optional[str] = None
-    area: Optional[str] = None
-    image_url: Optional[str] = None
+class ProductoCreate(ProductoBase):
+    pass
+
+class ProductoUpdate(BaseModel):
+    codigo_barras: Optional[str] = Field(None, max_length=50)
+    nombre: Optional[str] = Field(None, max_length=100)
+    descripcion: Optional[str] = Field(None, max_length=255)
+    categoria: Optional[str] = Field(None, max_length=50)
+    proveedor: Optional[str] = Field(None, max_length=100)
+    precio_compra: Optional[float] = Field(None, gt=0)
+    precio_venta: Optional[float] = Field(None, gt=0)
+    stock_actual: Optional[int] = Field(None, ge=0)
+    stock_minimo: Optional[int] = Field(None, ge=0)
+    fecha_vencimiento: Optional[date] = None
+    activo: Optional[bool] = None
+
+class Producto(ProductoBase):
+    id: int
+    fecha_creacion: datetime
+    activo: bool
+
+    class Config:
+        from_attributes = True
+
+# Funciones de base de datos
+def get_db_connection():
+    try:
+        conn = pyodbc.connect(conn_str)
+        return conn
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al conectar a la base de datos: {str(e)}")
 
 # ==================== INTERFAZ WEB ====================
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    """Interfaz web profesional"""
+async def home():
+    """Interfaz web principal del inventario"""
     return """
     <!DOCTYPE html>
     <html lang="es">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Meals Manager - Dashboard</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
-            body {
-                font-family: 'Inter', sans-serif;
-                background: #0f172a;
-                color: #e2e8f0;
-                min-height: 100vh;
-            }
-            
-            .navbar {
-                background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-                padding: 1.5rem 2rem;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-                border-bottom: 1px solid #334155;
-            }
-            
-            .navbar-content {
-                max-width: 1400px;
-                margin: 0 auto;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }
-            
-            .logo {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                font-size: 1.5rem;
-                font-weight: 700;
-                color: #fff;
-            }
-            
-            .logo-icon {
-                font-size: 2rem;
-            }
-            
-            .nav-links {
-                display: flex;
-                gap: 1rem;
-            }
-            
-            .nav-link {
-                color: #94a3b8;
-                text-decoration: none;
-                padding: 0.5rem 1rem;
-                border-radius: 6px;
-                transition: all 0.3s;
-                font-weight: 500;
-            }
-            
-            .nav-link:hover {
-                background: #334155;
-                color: #fff;
-            }
-            
-            .container {
-                max-width: 1400px;
-                margin: 2rem auto;
-                padding: 0 2rem;
-            }
-            
-            .header {
-                margin-bottom: 2rem;
-            }
-            
-            .header h1 {
-                font-size: 2.5rem;
-                margin-bottom: 0.5rem;
-                color: #fff;
-            }
-            
-            .header p {
-                color: #94a3b8;
-                font-size: 1.1rem;
-            }
-            
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 1.5rem;
-                margin-bottom: 2rem;
-            }
-            
-            .stat-card {
-                background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-                padding: 1.5rem;
-                border-radius: 12px;
-                border: 1px solid #334155;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-            }
-            
-            .stat-label {
-                color: #94a3b8;
-                font-size: 0.875rem;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                margin-bottom: 0.5rem;
-            }
-            
-            .stat-value {
-                font-size: 2.5rem;
-                font-weight: 700;
-                color: #fff;
-            }
-            
-            .actions-bar {
-                display: flex;
-                gap: 1rem;
-                margin-bottom: 2rem;
-                flex-wrap: wrap;
-            }
-            
-            .btn {
-                padding: 0.875rem 1.5rem;
-                border: none;
-                border-radius: 8px;
-                font-size: 1rem;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.3s;
-                display: flex;
-                align-items: center;
-                gap: 0.5rem;
-                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-            }
-            
-            .btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
-            }
-            
-            .btn-primary {
-                background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-                color: white;
-            }
-            
-            .btn-success {
-                background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-                color: white;
-            }
-            
-            .btn-warning {
-                background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-                color: white;
-            }
-            
-            .btn-danger {
-                background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-                color: white;
-            }
-            
-            .meals-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-                gap: 1.5rem;
-                margin-top: 2rem;
-            }
-            
-            .meal-card {
-                background: #1e293b;
-                border-radius: 12px;
-                overflow: hidden;
-                border: 1px solid #334155;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-                transition: all 0.3s;
-            }
-            
-            .meal-card:hover {
-                transform: translateY(-4px);
-                box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
-                border-color: #3b82f6;
-            }
-            
-            .meal-image {
-                width: 100%;
-                height: 220px;
-                object-fit: cover;
-                background: #334155;
-            }
-            
-            .meal-content {
-                padding: 1.5rem;
-            }
-            
-            .meal-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: start;
-                margin-bottom: 1rem;
-            }
-            
-            .meal-id {
-                background: #3b82f6;
-                color: white;
-                padding: 0.25rem 0.75rem;
-                border-radius: 20px;
-                font-size: 0.75rem;
-                font-weight: 700;
-            }
-            
-            .meal-name {
-                font-size: 1.25rem;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 1rem;
-                line-height: 1.4;
-            }
-            
-            .meal-tags {
-                display: flex;
-                gap: 0.5rem;
-                margin-bottom: 1rem;
-                flex-wrap: wrap;
-            }
-            
-            .meal-tag {
-                background: #334155;
-                padding: 0.375rem 0.75rem;
-                border-radius: 6px;
-                font-size: 0.875rem;
-                color: #cbd5e1;
-                font-weight: 500;
-            }
-            
-            .meal-actions {
-                display: flex;
-                gap: 0.5rem;
-                padding-top: 1rem;
-                border-top: 1px solid #334155;
-            }
-            
-            .btn-small {
-                padding: 0.5rem 1rem;
-                font-size: 0.875rem;
-                flex: 1;
-            }
-            
-            .modal {
-                display: none;
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0, 0, 0, 0.8);
-                z-index: 1000;
-                backdrop-filter: blur(4px);
-            }
-            
-            .modal.active {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-            
-            .modal-content {
-                background: #1e293b;
-                border-radius: 16px;
-                padding: 2rem;
-                max-width: 600px;
-                width: 90%;
-                max-height: 90vh;
-                overflow-y: auto;
-                border: 1px solid #334155;
-                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-            }
-            
-            .modal-header {
-                margin-bottom: 1.5rem;
-            }
-            
-            .modal-header h2 {
-                font-size: 1.75rem;
-                color: #fff;
-            }
-            
-            .form-group {
-                margin-bottom: 1.5rem;
-            }
-            
-            .form-label {
-                display: block;
-                margin-bottom: 0.5rem;
-                color: #cbd5e1;
-                font-weight: 600;
-                font-size: 0.875rem;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-            }
-            
-            .form-input {
-                width: 100%;
-                padding: 0.875rem;
-                border: 2px solid #334155;
-                border-radius: 8px;
-                font-size: 1rem;
-                background: #0f172a;
-                color: #fff;
-                transition: all 0.3s;
-            }
-            
-            .form-input:focus {
-                outline: none;
-                border-color: #3b82f6;
-                background: #1e293b;
-            }
-            
-            .alert {
-                padding: 1rem 1.5rem;
-                border-radius: 8px;
-                margin-bottom: 1.5rem;
-                display: none;
-                font-weight: 500;
-                animation: slideDown 0.3s;
-            }
-            
-            .alert.active {
-                display: block;
-            }
-            
-            .alert-success {
-                background: #10b981;
-                color: white;
-            }
-            
-            .alert-error {
-                background: #ef4444;
-                color: white;
-            }
-            
-            .loading {
-                text-align: center;
-                padding: 3rem;
-                color: #94a3b8;
-                font-size: 1.1rem;
-            }
-            
-            .empty-state {
-                text-align: center;
-                padding: 4rem 2rem;
-                color: #64748b;
-            }
-            
-            .empty-icon {
-                font-size: 4rem;
-                margin-bottom: 1rem;
-            }
-            
-            @keyframes slideDown {
-                from {
-                    opacity: 0;
-                    transform: translateY(-10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-            
-            @media (max-width: 768px) {
-                .navbar-content {
-                    flex-direction: column;
-                    gap: 1rem;
-                }
-                
-                .header h1 {
-                    font-size: 2rem;
-                }
-                
-                .meals-grid {
-                    grid-template-columns: 1fr;
-                }
-            }
-        </style>
+        <title>🏪 Gestión de Inventario</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
     </head>
-    <body>
-        <nav class="navbar">
-            <div class="navbar-content">
-                <div class="logo">
-                    <span class="logo-icon">🍽️</span>
-                    <span>Meals Manager</span>
+    <body class="bg-gray-50">
+        <div class="min-h-screen">
+            <!-- Barra de navegación -->
+            <nav class="bg-blue-600 text-white shadow-lg">
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <div class="flex justify-between h-16">
+                        <div class="flex items-center">
+                            <i class="ri-store-2-line text-2xl mr-2"></i>
+                            <span class="text-xl font-bold">Sistema de Inventario</span>
+                        </div>
+                        <div class="flex items-center space-x-4">
+                            <button onclick="mostrarModalAgregar()" class="bg-green-500 hover:bg-green-600 px-4 py-2 rounded-md flex items-center">
+                                <i class="ri-add-line mr-1"></i> Nuevo Producto
+                            </button>
+                        </div>
+                    </div>
                 </div>
-                <div class="nav-links">
-                    <a href="/" class="nav-link">Dashboard</a>
-                    <a href="/docs" class="nav-link">API Docs</a>
-                </div>
-            </div>
-        </nav>
-        
-        <div class="container">
-            <div class="header">
-                <h1>Dashboard de Comidas</h1>
-                <p>Gestiona tu colección de recetas internacionales</p>
-            </div>
-            
-            <div id="alert" class="alert"></div>
-            
-            <div class="stats-grid" id="stats"></div>
-            
-            <div class="actions-bar">
-                <button class="btn btn-primary" onclick="loadMeals()">
-                    📋 Cargar Todas
-                </button>
-                <button class="btn btn-success" onclick="getRandomMeal()">
-                    🎲 Comida Aleatoria
-                </button>
-                <button class="btn btn-warning" onclick="openModal('create')">
-                    ➕ Agregar Nueva
-                </button>
-                <button class="btn btn-danger" onclick="confirmDeleteAll()">
-                    🗑️ Eliminar Todas
-                </button>
-            </div>
-            
-            <div id="mealsList" class="meals-grid"></div>
-        </div>
-        
-        <!-- Modal Crear -->
-        <div id="createModal" class="modal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>➕ Agregar Nueva Comida</h2>
-                </div>
-                <form id="createForm">
-                    <div class="form-group">
-                        <label class="form-label">Nombre</label>
-                        <input type="text" id="create_name" class="form-input" placeholder="Ej: Spaghetti Carbonara" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Categoría</label>
-                        <input type="text" id="create_categoria" class="form-input" placeholder="Ej: Pasta" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">País/Área</label>
-                        <input type="text" id="create_area" class="form-input" placeholder="Ej: Italian" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">URL de la Imagen</label>
-                        <input type="url" id="create_image" class="form-input" placeholder="https://..." required>
-                    </div>
-                    <div style="display: flex; gap: 1rem;">
-                        <button type="submit" class="btn btn-success" style="flex: 1;">💾 Guardar</button>
-                        <button type="button" class="btn btn-danger" onclick="closeModal('create')" style="flex: 1;">❌ Cancelar</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        
-        <!-- Modal Editar -->
-        <div id="editModal" class="modal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>✏️ Editar Comida #<span id="edit_id"></span></h2>
-                </div>
-                <form id="editForm">
-                    <div class="form-group">
-                        <label class="form-label">Nombre</label>
-                        <input type="text" id="edit_name" class="form-input">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Categoría</label>
-                        <input type="text" id="edit_categoria" class="form-input">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">País/Área</label>
-                        <input type="text" id="edit_area" class="form-input">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">URL de la Imagen</label>
-                        <input type="url" id="edit_image" class="form-input">
-                    </div>
-                    <div style="display: flex; gap: 1rem;">
-                        <button type="submit" class="btn btn-success" style="flex: 1;">✅ Actualizar</button>
-                        <button type="button" class="btn btn-danger" onclick="closeModal('edit')" style="flex: 1;">❌ Cancelar</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        
-        <script>
-            let currentEditId = null;
-            
-            window.onload = () => loadMeals();
-            
-            function showAlert(message, type) {
-                const alert = document.getElementById('alert');
-                alert.textContent = message;
-                alert.className = \`alert alert-\${type} active\`;
-                setTimeout(() => alert.className = 'alert', 5000);
-            }
-            
-            function updateStats(total) {
-                const stats = document.getElementById('stats');
-                stats.innerHTML = \`
-                    <div class="stat-card">
-                        <div class="stat-label">Total Comidas</div>
-                        <div class="stat-value">\${total}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">Estado</div>
-                        <div class="stat-value" style="font-size: 1.5rem;">✅ Activo</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">Base de Datos</div>
-                        <div class="stat-value" style="font-size: 1.5rem;">🗄️ SQL Server</div>
-                    </div>
-                \`;
-            }
-            
-            async function loadMeals() {
-                const list = document.getElementById('mealsList');
-                list.innerHTML = '<div class="loading">🍳 Cargando comidas...</div>';
-                
-                try {
-                    const response = await fetch('/meals');
-                    const data = await response.json();
-                    
-                    updateStats(data.total);
-                    
-                    if (data.meals.length === 0) {
-                        list.innerHTML = \`
-                            <div class="empty-state" style="grid-column: 1 / -1;">
-                                <div class="empty-icon">🍽️</div>
-                                <h3 style="margin-bottom: 0.5rem; color: #94a3b8;">No hay comidas registradas</h3>
-                                <p>Comienza agregando una comida o obtén una aleatoria</p>
+            </nav>
+
+            <!-- Contenido principal -->
+            <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+                <!-- Resúmenes -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div class="bg-white rounded-lg shadow p-6">
+                        <div class="flex items-center">
+                            <div class="p-3 rounded-full bg-blue-100 text-blue-600 mr-4">
+                                <i class="ri-box-2-line text-2xl"></i>
                             </div>
-                        \`;
-                        return;
-                    }
-                    
-                    list.innerHTML = data.meals.map(meal => \`
-                        <div class="meal-card">
-                            <img src="\${meal.image_url}" alt="\${meal.name}" class="meal-image" 
-                                 onerror="this.src='https://via.placeholder.com/320x220/334155/94a3b8?text=No+Image'">
-                            <div class="meal-content">
-                                <div class="meal-header">
-                                    <div class="meal-id">ID: \${meal.id}</div>
-                                </div>
-                                <div class="meal-name">\${meal.name}</div>
-                                <div class="meal-tags">
-                                    <span class="meal-tag">📁 \${meal.categoria}</span>
-                                    <span class="meal-tag">🌍 \${meal.area}</span>
-                                </div>
-                                <div class="meal-actions">
-                                    <button class="btn btn-warning btn-small" onclick="editMeal(\${meal.id})">
-                                        ✏️ Editar
-                                    </button>
-                                    <button class="btn btn-danger btn-small" onclick="deleteMeal(\${meal.id})">
-                                        🗑️ Eliminar
-                                    </button>
-                                </div>
+                            <div>
+                                <p class="text-gray-500 text-sm">Total Productos</p>
+                                <h3 id="total-productos" class="text-2xl font-bold">0</h3>
                             </div>
                         </div>
-                    \`).join('');
-                    
-                    showAlert(\`✅ Se cargaron \${data.total} comidas\`, 'success');
-                } catch (error) {
-                    list.innerHTML = '<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-icon">❌</div><p>Error al cargar las comidas</p></div>';
-                    showAlert('❌ Error al cargar las comidas', 'error');
-                }
-            }
+                    </div>
+                    <div class="bg-white rounded-lg shadow p-6">
+                        <div class="flex items-center">
+                            <div class="p-3 rounded-full bg-yellow-100 text-yellow-600 mr-4">
+                                <i class="ri-alert-line text-2xl"></i>
+                            </div>
+                            <div>
+                                <p class="text-gray-500 text-sm">Stock Bajo</p>
+                                <h3 id="stock-bajo" class="text-2xl font-bold">0</h3>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-lg shadow p-6">
+                        <div class="flex items-center">
+                            <div class="p-3 rounded-full bg-red-100 text-red-600 mr-4">
+                                <i class="ri-calendar-close-line text-2xl"></i>
+                            </div>
+                            <div>
+                                <p class="text-gray-500 text-sm">Por Vencer</p>
+                                <h3 id="por-vencer" class="text-2xl font-bold">0</h3>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tabla de productos -->
+                <div class="bg-white shadow rounded-lg overflow-hidden">
+                    <div class="px-6 py-4 border-b border-gray-200">
+                        <h2 class="text-lg font-medium text-gray-900">Inventario de Productos</h2>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Código</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Producto</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Categoría</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stock</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Precio Venta</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Vencimiento</th>
+                                    <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Acciones</th>
+                                </tr>
+                            </thead>
+                            <tbody id="productos-table" class="bg-white divide-y divide-gray-200">
+                                <!-- Los productos se cargarán aquí dinámicamente -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Modal para agregar/editar producto -->
+        <div id="modal-producto" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+            <div class="bg-white rounded-lg w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+                <div class="p-6">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 id="modal-titulo" class="text-xl font-bold">Nuevo Producto</h3>
+                        <button onclick="cerrarModal()" class="text-gray-500 hover:text-gray-700">
+                            <i class="ri-close-line text-2xl"></i>
+                        </button>
+                    </div>
+                    <form id="form-producto" class="space-y-4">
+                        <input type="hidden" id="producto-id">
+                        
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label for="codigo_barras" class="block text-sm font-medium text-gray-700">Código de Barras</label>
+                                <input type="text" id="codigo_barras" name="codigo_barras" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="nombre" class="block text-sm font-medium text-gray-700">Nombre del Producto</label>
+                                <input type="text" id="nombre" name="nombre" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div class="md:col-span-2">
+                                <label for="descripcion" class="block text-sm font-medium text-gray-700">Descripción</label>
+                                <textarea id="descripcion" name="descripcion" rows="2"
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"></textarea>
+                            </div>
+                            
+                            <div>
+                                <label for="categoria" class="block text-sm font-medium text-gray-700">Categoría</label>
+                                <input type="text" id="categoria" name="categoria"
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="proveedor" class="block text-sm font-medium text-gray-700">Proveedor</label>
+                                <input type="text" id="proveedor" name="proveedor"
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="precio_compra" class="block text-sm font-medium text-gray-700">Precio de Compra</label>
+                                <input type="number" id="precio_compra" name="precio_compra" step="0.01" min="0" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="precio_venta" class="block text-sm font-medium text-gray-700">Precio de Venta</label>
+                                <input type="number" id="precio_venta" name="precio_venta" step="0.01" min="0" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="stock_actual" class="block text-sm font-medium text-gray-700">Stock Actual</label>
+                                <input type="number" id="stock_actual" name="stock_actual" min="0" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="stock_minimo" class="block text-sm font-medium text-gray-700">Stock Mínimo</label>
+                                <input type="number" id="stock_minimo" name="stock_minimo" min="0" required
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label for="fecha_vencimiento" class="block text-sm font-medium text-gray-700">Fecha de Vencimiento</label>
+                                <input type="date" id="fecha_vencimiento" name="fecha_vencimiento"
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            </div>
+                            
+                            <div class="flex items-center">
+                                <input type="checkbox" id="activo" name="activo" checked
+                                    class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
+                                <label for="activo" class="ml-2 block text-sm text-gray-700">Producto Activo</label>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-end space-x-3 pt-4">
+                            <button type="button" onclick="cerrarModal()"
+                                class="px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                                Cancelar
+                            </button>
+                            <button type="submit"
+                                class="px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                                Guardar
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            // Variables globales
+            let productos = [];
+            let modoEdicion = false;
             
-            async function getRandomMeal() {
-                showAlert('🎲 Obteniendo comida aleatoria...', 'success');
-                try {
-                    const response = await fetch('/meals/random/api');
-                    const data = await response.json();
-                    showAlert(\`✅ Comida guardada: "\${data.meal.name}"\`, 'success');
-                    loadMeals();
-                } catch (error) {
-                    showAlert('❌ Error al obtener comida aleatoria', 'error');
-                }
-            }
-            
-            function openModal(type) {
-                document.getElementById(\`\${type}Modal\`).classList.add('active');
-            }
-            
-            function closeModal(type) {
-                document.getElementById(\`\${type}Modal\`).classList.remove('active');
-            }
-            
-            document.getElementById('createForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
-                
-                const meal = {
-                    name: document.getElementById('create_name').value,
-                    categoria: document.getElementById('create_categoria').value,
-                    area: document.getElementById('create_area').value,
-                    image_url: document.getElementById('create_image').value
-                };
-                
-                try {
-                    const response = await fetch('/meals', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(meal)
-                    });
-                    
-                    if (response.ok) {
-                        showAlert('✅ Comida creada exitosamente', 'success');
-                        closeModal('create');
-                        e.target.reset();
-                        loadMeals();
-                    } else {
-                        showAlert('❌ Error al crear la comida', 'error');
-                    }
-                } catch (error) {
-                    showAlert('❌ Error de conexión', 'error');
-                }
+            // Cargar datos al iniciar
+            document.addEventListener('DOMContentLoaded', function() {
+                cargarProductos();
+                configurarFormulario();
             });
             
-            async function editMeal(id) {
+            // Configurar el formulario
+            function configurarFormulario() {
+                const form = document.getElementById('form-producto');
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    guardarProducto();
+                });
+                
+                // Validar que el precio de venta sea mayor o igual al de compra
+                const precioCompra = document.getElementById('precio_compra');
+                const precioVenta = document.getElementById('precio_venta');
+                
+                [precioCompra, precioVenta].forEach(input => {
+                    input.addEventListener('change', function() {
+                        const compra = parseFloat(precioCompra.value) || 0;
+                        const venta = parseFloat(precioVenta.value) || 0;
+                        
+                        if (venta < compra) {
+                            alert('El precio de venta no puede ser menor al precio de compra');
+                            precioVenta.value = compra.toFixed(2);
+                        }
+                    });
+                });
+            }
+            
+            // Cargar lista de productos
+            async function cargarProductos() {
                 try {
-                    const response = await fetch(\`/meals/\${id}\`);
-                    const meal = await response.json();
+                    const response = await fetch('/api/productos');
+                    if (!response.ok) throw new Error('Error al cargar productos');
                     
-                    currentEditId = id;
-                    document.getElementById('edit_id').textContent = id;
-                    document.getElementById('edit_name').value = meal.name;
-                    document.getElementById('edit_categoria').value = meal.categoria;
-                    document.getElementById('edit_area').value = meal.area;
-                    document.getElementById('edit_image').value = meal.image_url;
-                    
-                    openModal('edit');
+                    productos = await response.json();
+                    actualizarTabla();
+                    actualizarResumenes();
                 } catch (error) {
-                    showAlert('❌ Error al cargar la comida', 'error');
+                    console.error('Error:', error);
+                    alert('Error al cargar los productos: ' + error.message);
                 }
             }
             
-            document.getElementById('editForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
+            // Actualizar la tabla de productos
+            function actualizarTabla() {
+                const tbody = document.getElementById('productos-table');
+                tbody.innerHTML = '';
                 
-                const meal = {
-                    name: document.getElementById('edit_name').value,
-                    categoria: document.getElementById('edit_categoria').value,
-                    area: document.getElementById('edit_area').value,
-                    image_url: document.getElementById('edit_image').value
-                };
+                if (productos.length === 0) {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td colspan="7" class="px-6 py-4 text-center text-gray-500">
+                            No hay productos registrados
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                    return;
+                }
                 
+                productos.forEach(producto => {
+                    const tr = document.createElement('tr');
+                    tr.className = producto.activo ? '' : 'bg-gray-50 text-gray-400';
+                    
+                    // Formatear fecha
+                    const fechaVencimiento = producto.fecha_vencimiento 
+                        ? new Date(producto.fecha_vencimiento).toLocaleDateString('es-ES')
+                        : 'Sin fecha';
+                    
+                    // Determinar clases de stock
+                    let stockClases = 'px-2 inline-flex text-xs leading-5 font-semibold rounded-full ';
+                    if (producto.stock_actual <= 0) {
+                        stockClases += 'bg-red-100 text-red-800';
+                    } else if (producto.stock_actual <= producto.stock_minimo) {
+                        stockClases += 'bg-yellow-100 text-yellow-800';
+                    } else {
+                        stockClases += 'bg-green-100 text-green-800';
+                    }
+                    
+                    tr.innerHTML = `
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${producto.codigo_barras}</td>
+                        <td class="px-6 py-4">
+                            <div class="text-sm font-medium ${producto.activo ? 'text-gray-900' : 'text-gray-400'}">${producto.nombre}</div>
+                            <div class="text-sm ${producto.activo ? 'text-gray-500' : 'text-gray-400'}">${producto.descripcion || 'Sin descripción'}</div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm ${producto.activo ? 'text-gray-900' : 'text-gray-400'}">${producto.categoria || 'Sin categoría'}</td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="${stockClases}">
+                                ${producto.stock_actual} ${producto.stock_actual <= producto.stock_minimo ? '⚠️' : ''}
+                            </span>
+                            ${producto.stock_actual <= producto.stock_minimo ? 
+                              `<span class="text-xs text-gray-500 ml-1">(mín: ${producto.stock_minimo})</span>` : ''}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm ${producto.activo ? 'text-gray-900' : 'text-gray-400'}">
+                            $${producto.precio_venta.toFixed(2)}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm ${producto.activo ? 'text-gray-900' : 'text-gray-400'}">
+                            ${fechaVencimiento}
+                            ${producto.fecha_vencimiento && new Date(producto.fecha_vencimiento) < new Date() ? '⚠️' : ''}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <button onclick="editarProducto(${producto.id})" class="text-blue-600 hover:text-blue-900 mr-3">
+                                <i class="ri-edit-line"></i>
+                            </button>
+                            <button onclick="eliminarProducto(${producto.id})" class="text-red-600 hover:text-red-900">
+                                <i class="ri-delete-bin-line"></i>
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+            
+            // Actualizar resúmenes
+            function actualizarResumenes() {
+                // Total de productos
+                document.getElementById('total-productos').textContent = productos.length;
+                
+                // Productos con stock bajo
+                const stockBajo = productos.filter(p => p.stock_actual <= p.stock_minimo && p.activo).length;
+                document.getElementById('stock-bajo').textContent = stockBajo;
+                
+                // Productos por vencer (en los próximos 30 días)
+                const hoy = new Date();
+                const en30Dias = new Date();
+                en30Dias.setDate(hoy.getDate() + 30);
+                
+                const porVencer = productos.filter(p => {
+                    if (!p.fecha_vencimiento || !p.activo) return false;
+                    const fechaVencimiento = new Date(p.fecha_vencimiento);
+                    return fechaVencimiento >= hoy && fechaVencimiento <= en30Dias;
+                }).length;
+                
+                document.getElementById('por-vencer').textContent = porVencer;
+            }
+            
+            // Mostrar modal para agregar producto
+            function mostrarModalAgregar() {
+                modoEdicion = false;
+                document.getElementById('modal-titulo').textContent = 'Nuevo Producto';
+                document.getElementById('form-producto').reset();
+                document.getElementById('producto-id').value = '';
+                document.getElementById('modal-producto').classList.remove('hidden');
+                document.getElementById('modal-producto').classList.add('flex');
+            }
+            
+            // Cerrar modal
+            function cerrarModal() {
+                document.getElementById('modal-producto').classList.add('hidden');
+                document.getElementById('modal-producto').classList.remove('flex');
+            }
+            
+            // Cargar datos de un producto en el formulario
+            async function editarProducto(id) {
                 try {
-                    const response = await fetch(\`/meals/\${currentEditId}\`, {
-                        method: 'PUT',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(meal)
+                    const response = await fetch(`/api/productos/${id}`);
+                    if (!response.ok) throw new Error('Error al cargar el producto');
+                    
+                    const producto = await response.json();
+                    
+                    modoEdicion = true;
+                    document.getElementById('modal-titulo').textContent = 'Editar Producto';
+                    
+                    // Llenar el formulario con los datos del producto
+                    const form = document.getElementById('form-producto');
+                    form.reset();
+                    
+                    document.getElementById('producto-id').value = producto.id;
+                    document.getElementById('codigo_barras').value = producto.codigo_barras;
+                    document.getElementById('nombre').value = producto.nombre;
+                    document.getElementById('descripcion').value = producto.descripcion || '';
+                    document.getElementById('categoria').value = producto.categoria || '';
+                    document.getElementById('proveedor').value = producto.proveedor || '';
+                    document.getElementById('precio_compra').value = producto.precio_compra;
+                    document.getElementById('precio_venta').value = producto.precio_venta;
+                    document.getElementById('stock_actual').value = producto.stock_actual;
+                    document.getElementById('stock_minimo').value = producto.stock_minimo;
+                    document.getElementById('activo').checked = producto.activo;
+                    
+                    if (producto.fecha_vencimiento) {
+                        const fecha = new Date(producto.fecha_vencimiento);
+                        const fechaFormato = fecha.toISOString().split('T')[0];
+                        document.getElementById('fecha_vencimiento').value = fechaFormato;
+                    } else {
+                        document.getElementById('fecha_vencimiento').value = '';
+                    }
+                    
+                    document.getElementById('modal-producto').classList.remove('hidden');
+                    document.getElementById('modal-producto').classList.add('flex');
+                    
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('Error al cargar el producto: ' + error.message);
+                }
+            }
+            
+            // Guardar producto (crear o actualizar)
+            async function guardarProducto() {
+                try {
+                    const form = document.getElementById('form-producto');
+                    const formData = new FormData(form);
+                    const productoId = document.getElementById('producto-id').value;
+                    
+                    const productoData = {
+                        codigo_barras: formData.get('codigo_barras'),
+                        nombre: formData.get('nombre'),
+                        descripcion: formData.get('descripcion') || null,
+                        categoria: formData.get('categoria') || null,
+                        proveedor: formData.get('proveedor') || null,
+                        precio_compra: parseFloat(formData.get('precio_compra')),
+                        precio_venta: parseFloat(formData.get('precio_venta')),
+                        stock_actual: parseInt(formData.get('stock_actual')),
+                        stock_minimo: parseInt(formData.get('stock_minimo')),
+                        fecha_vencimiento: formData.get('fecha_vencimiento') || null,
+                        activo: formData.get('activo') === 'on'
+                    };
+                    
+                    let response;
+                    const url = modoEdicion 
+                        ? `/api/productos/${productoId}`
+                        : '/api/productos';
+                    
+                    const method = modoEdicion ? 'PUT' : 'POST';
+                    
+                    response = await fetch(url, {
+                        method: method,
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(productoData)
                     });
                     
-                    if (response.ok) {
-                        showAlert('✅ Comida actualizada exitosamente', 'success');
-                        closeModal('edit');
-                        loadMeals();
-                    } else {
-                        showAlert('❌ Error al actualizar la comida', 'error');
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Error al guardar el producto');
                     }
+                    
+                    cerrarModal();
+                    cargarProductos();
+                    
                 } catch (error) {
-                    showAlert('❌ Error de conexión', 'error');
-                }
-            });
-            
-            async function deleteMeal(id) {
-                if (!confirm(\`¿Eliminar la comida #\${id}?\`)) return;
-                
-                try {
-                    const response = await fetch(\`/meals/\${id}\`, { method: 'DELETE' });
-                    if (response.ok) {
-                        showAlert(\`✅ Comida #\${id} eliminada\`, 'success');
-                        loadMeals();
-                    } else {
-                        showAlert('❌ Error al eliminar', 'error');
-                    }
-                } catch (error) {
-                    showAlert('❌ Error de conexión', 'error');
+                    console.error('Error:', error);
+                    alert('Error al guardar el producto: ' + error.message);
                 }
             }
             
-            async function confirmDeleteAll() {
-                if (!confirm('⚠️ ¿Eliminar TODAS las comidas?')) return;
+            // Eliminar producto
+            async function eliminarProducto(id) {
+                if (!confirm('¿Estás seguro de que deseas eliminar este producto?')) {
+                    return;
+                }
                 
                 try {
-                    const response = await fetch('/meals', { method: 'DELETE' });
-                    const data = await response.json();
-                    showAlert(\`✅ \${data.mensaje}\`, 'success');
-                    loadMeals();
+                    const response = await fetch(`/api/productos/${id}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Error al eliminar el producto');
+                    }
+                    
+                    cargarProductos();
+                    
                 } catch (error) {
-                    showAlert('❌ Error al eliminar', 'error');
+                    console.error('Error:', error);
+                    alert('Error al eliminar el producto: ' + error.message);
                 }
             }
         </script>
@@ -749,198 +558,291 @@ def home():
 
 # ==================== API ENDPOINTS ====================
 
-@app.get("/meals")
-def get_all_meals():
-    """Listar todas las comidas"""
+@app.post("/api/productos/", response_model=Producto)
+async def crear_producto(producto: ProductoCreate):
+    """Crear un nuevo producto en el inventario"""
+    conn = None
+    cursor = None
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, name, categoria, area, image_url FROM Meals ORDER BY id DESC")
-            rows = cursor.fetchall()
-            
-            meals = [
-                {
-                    "id": r[0],
-                    "name": r[1],
-                    "categoria": r[2],
-                    "area": r[3],
-                    "image_url": r[4]
-                } for r in rows
-            ]
-            
-            return {"total": len(meals), "meals": meals}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/meals/{meal_id}")
-def get_meal(meal_id: int):
-    """Obtener una comida por ID"""
-    try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, name, categoria, area, image_url FROM Meals WHERE id = ?",
-                meal_id
-            )
-            row = cursor.fetchone()
-            
-            if not row:
-                raise HTTPException(status_code=404, detail="Comida no encontrada")
-            
-            return {
-                "id": row[0],
-                "name": row[1],
-                "categoria": row[2],
-                "area": row[3],
-                "image_url": row[4]
-            }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/meals/random/api")
-def get_random_meal():
-    """Obtener comida aleatoria de TheMealDB y guardarla"""
-    try:
-        response = requests.get(THEMEALDB_URL)
-        response.raise_for_status()
-        data = response.json()["meals"][0]
-
-        name = data["strMeal"]
-        categoria = data["strCategory"]
-        area = data["strArea"]
-        image_url = data["strMealThumb"]
-
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO Meals (name, categoria, area, image_url) OUTPUT INSERTED.id VALUES (?, ?, ?, ?)",
-                name, categoria, area, image_url
-            )
-            new_id = cursor.fetchone()[0]
-            conn.commit()
-
-        return {
-            "mensaje": "Comida guardada exitosamente",
-            "meal": {
-                "id": new_id,
-                "name": name,
-                "categoria": categoria,
-                "area": area,
-                "image_url": image_url
-            }
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/meals")
-def create_meal(meal: MealCreate):
-    """Crear una comida manualmente"""
-    try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO Meals (name, categoria, area, image_url) OUTPUT INSERTED.id VALUES (?, ?, ?, ?)",
-                meal.name, meal.categoria, meal.area, meal.image_url
-            )
-            new_id = cursor.fetchone()[0]
-            conn.commit()
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        return {
-            "mensaje": "Comida creada exitosamente",
-            "meal": {
-                "id": new_id,
-                "name": meal.name,
-                "categoria": meal.categoria,
-                "area": meal.area,
-                "image_url": meal.image_url
-            }
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/meals/{meal_id}")
-def update_meal(meal_id: int, meal: MealUpdate):
-    """Actualizar una comida"""
-    try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT id, name, categoria, area, image_url FROM Meals WHERE id = ?", meal_id)
-            existing = cursor.fetchone()
-            
-            if not existing:
-                raise HTTPException(status_code=404, detail="Comida no encontrada")
-            
-            new_name = meal.name if meal.name else existing[1]
-            new_categoria = meal.categoria if meal.categoria else existing[2]
-            new_area = meal.area if meal.area else existing[3]
-            new_image = meal.image_url if meal.image_url else existing[4]
-            
-            cursor.execute(
-                "UPDATE Meals SET name = ?, categoria = ?, area = ?, image_url = ? WHERE id = ?",
-                new_name, new_categoria, new_area, new_image, meal_id
+        query = """
+        INSERT INTO Productos (
+            codigo_barras, nombre, descripcion, categoria, proveedor,
+            precio_compra, precio_venta, stock_actual, stock_minimo, fecha_vencimiento
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        cursor.execute(
+            query,
+            (
+                producto.codigo_barras,
+                producto.nombre,
+                producto.descripcion,
+                producto.categoria,
+                producto.proveedor,
+                producto.precio_compra,
+                producto.precio_venta,
+                producto.stock_actual,
+                producto.stock_minimo,
+                producto.fecha_vencimiento
             )
-            conn.commit()
+        )
+        
+        # Obtener el ID del producto recién insertado
+        cursor.execute("SELECT SCOPE_IDENTITY()")
+        producto_id = cursor.fetchone()[0]
+        
+        conn.commit()
+        
+        # Obtener el producto completo para devolverlo
+        cursor.execute(
+            "SELECT * FROM Productos WHERE id = ?",
+            (producto_id,)
+        )
+        
+        columns = [column[0] for column in cursor.description]
+        producto_creado = dict(zip(columns, cursor.fetchone()))
+        
+        return producto_creado
+        
+    except pyodbc.IntegrityError as e:
+        if "IX_Productos_codigo_barras" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail="Ya existe un producto con este código de barras"
+            )
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.get("/api/productos/", response_model=List[Producto])
+async def listar_productos(activo: bool = None, categoria: str = None):
+    """Listar todos los productos del inventario"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM Productos WHERE 1=1"
+        params = []
+        
+        if activo is not None:
+            query += " AND activo = ?"
+            params.append(activo)
             
-            return {
-                "mensaje": "Comida actualizada exitosamente",
-                "meal": {
-                    "id": meal_id,
-                    "name": new_name,
-                    "categoria": new_categoria,
-                    "area": new_area,
-                    "image_url": new_image
-                }
-            }
-    
+        if categoria:
+            query += " AND categoria = ?"
+            params.append(categoria)
+            
+        query += " ORDER BY nombre"
+        
+        cursor.execute(query, params)
+        
+        columns = [column[0] for column in cursor.description]
+        productos = []
+        
+        for row in cursor.fetchall():
+            # Convertir la fecha de vencimiento a string ISO si existe
+            row_dict = dict(zip(columns, row))
+            if 'fecha_vencimiento' in row_dict and row_dict['fecha_vencimiento']:
+                row_dict['fecha_vencimiento'] = row_dict['fecha_vencimiento'].isoformat()
+            if 'fecha_creacion' in row_dict and row_dict['fecha_creacion']:
+                row_dict['fecha_creacion'] = row_dict['fecha_creacion'].isoformat()
+            productos.append(row_dict)
+        
+        return productos
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.get("/api/productos/{producto_id}", response_model=Producto)
+async def obtener_producto(producto_id: int):
+    """Obtener un producto por su ID"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT * FROM Productos WHERE id = ?",
+            (producto_id,)
+        )
+        
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Producto no encontrado")
+        
+        columns = [column[0] for column in cursor.description]
+        producto = dict(zip(columns, row))
+        
+        # Convertir fechas a string ISO
+        if 'fecha_vencimiento' in producto and producto['fecha_vencimiento']:
+            producto['fecha_vencimiento'] = producto['fecha_vencimiento'].isoformat()
+        if 'fecha_creacion' in producto and producto['fecha_creacion']:
+            producto['fecha_creacion'] = producto['fecha_creacion'].isoformat()
+        
+        return producto
+        
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
-@app.delete("/meals/{meal_id}")
-def delete_meal(meal_id: int):
-    """Eliminar una comida por ID"""
+@app.put("/api/productos/{producto_id}", response_model=Producto)
+async def actualizar_producto(producto_id: int, producto: ProductoUpdate):
+    """Actualizar un producto existente"""
+    conn = None
+    cursor = None
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
+        # Verificar si el producto existe
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id FROM Productos WHERE id = ?", (producto_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Producto no encontrado")
+        
+        # Construir la consulta dinámicamente basada en los campos proporcionados
+        update_fields = []
+        params = []
+        
+        if producto.codigo_barras is not None:
+            update_fields.append("codigo_barras = ?")
+            params.append(producto.codigo_barras)
             
-            cursor.execute("SELECT id FROM Meals WHERE id = ?", meal_id)
-            if not cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Comida no encontrada")
+        if producto.nombre is not None:
+            update_fields.append("nombre = ?")
+            params.append(producto.nombre)
             
-            cursor.execute("DELETE FROM Meals WHERE id = ?", meal_id)
-            conn.commit()
+        if producto.descripcion is not None:
+            update_fields.append("descripcion = ?")
+            params.append(producto.descripcion)
             
-            return {"mensaje": f"Comida con ID {meal_id} eliminada exitosamente"}
-    
+        if producto.categoria is not None:
+            update_fields.append("categoria = ?")
+            params.append(producto.categoria)
+            
+        if producto.proveedor is not None:
+            update_fields.append("proveedor = ?")
+            params.append(producto.proveedor)
+            
+        if producto.precio_compra is not None:
+            update_fields.append("precio_compra = ?")
+            params.append(producto.precio_compra)
+            
+        if producto.precio_venta is not None:
+            update_fields.append("precio_venta = ?")
+            params.append(producto.precio_venta)
+            
+        if producto.stock_actual is not None:
+            update_fields.append("stock_actual = ?")
+            params.append(producto.stock_actual)
+            
+        if producto.stock_minimo is not None:
+            update_fields.append("stock_minimo = ?")
+            params.append(producto.stock_minimo)
+            
+        if producto.fecha_vencimiento is not None:
+            update_fields.append("fecha_vencimiento = ?")
+            params.append(producto.fecha_vencimiento)
+            
+        if producto.activo is not None:
+            update_fields.append("activo = ?")
+            params.append(producto.activo)
+        
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No se proporcionaron datos para actualizar")
+        
+        # Agregar el ID al final para el WHERE
+        params.append(producto_id)
+        
+        # Construir y ejecutar la consulta
+        query = f"UPDATE Productos SET {', '.join(update_fields)} WHERE id = ?"
+        cursor.execute(query, params)
+        
+        conn.commit()
+        
+        # Obtener el producto actualizado para devolverlo
+        cursor.execute("SELECT * FROM Productos WHERE id = ?", (producto_id,))
+        
+        columns = [column[0] for column in cursor.description]
+        producto_actualizado = dict(zip(columns, cursor.fetchone()))
+        
+        # Convertir fechas a string ISO
+        if 'fecha_vencimiento' in producto_actualizado and producto_actualizado['fecha_vencimiento']:
+            producto_actualizado['fecha_vencimiento'] = producto_actualizado['fecha_vencimiento'].isoformat()
+        if 'fecha_creacion' in producto_actualizado and producto_actualizado['fecha_creacion']:
+            producto_actualizado['fecha_creacion'] = producto_actualizado['fecha_creacion'].isoformat()
+        
+        return producto_actualizado
+        
+    except pyodbc.IntegrityError as e:
+        if "IX_Productos_codigo_barras" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail="Ya existe un producto con este código de barras"
+            )
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
-@app.delete("/meals")
-def delete_all_meals():
-    """Eliminar todas las comidas"""
+@app.delete("/api/productos/{producto_id}")
+async def eliminar_producto(producto_id: int):
+    """Eliminar un producto del inventario"""
+    conn = None
+    cursor = None
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM Meals")
-            count = cursor.fetchone()[0]
-            
-            cursor.execute("DELETE FROM Meals")
-            conn.commit()
-            
-            return {
-                "mensaje": f"Se eliminaron {count} comidas exitosamente",
-                "total_eliminados": count
-            }
-    
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Verificar si el producto existe
+        cursor.execute("SELECT id FROM Productos WHERE id = ?", (producto_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Producto no encontrado")
+        
+        # Eliminar el producto
+        cursor.execute("DELETE FROM Productos WHERE id = ?", (producto_id,))
+        conn.commit()
+        
+        return {"mensaje": "Producto eliminado correctamente"}
+        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# Ejecutar la aplicación si se ejecuta directamente
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
