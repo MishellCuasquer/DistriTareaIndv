@@ -29,18 +29,6 @@ docker-compose up --build
 
 ## Uso de la API
 
-### Endpoints disponibles
-
-
- GET    | `/`                   | Interfaz web del dashboard           
- GET    | `/meals`              | Lista todas las comidas              
- GET    | `/meals/{id}`         | Obtiene una comida por ID            
- GET    | `/meals/random/api`   | Obtiene comida aleatoria de TheMealDB
- POST   | `/meals`              | Crea una nueva comida                
- PUT    | `/meals/{id}`         | Actualiza una comida                 
- DELETE | `/meals/{id}`         | Elimina una comida                   
- DELETE | `/meals`              | Elimina todas las comidas            
-
 
 
 **Desde el navegador:**
@@ -107,17 +95,6 @@ docker-compose down
 # Detener y eliminar volúmenes (borra datos)
 docker-compose down -v
 ```
-
-## Variables de entorno (api/.env)
-```properties
-DB_SERVER=sqlserver
-DB_NAME=MealsDB
-DB_USER=sa
-DB_PASSWORD=YourStrong@Passw0rd
-DB_PORT=1433
-DB_DRIVER=ODBC Driver 18 for SQL Server
-```
-
 
 
 ###  No se puede conectar a SQL Server
